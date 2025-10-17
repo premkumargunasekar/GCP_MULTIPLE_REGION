@@ -1,8 +1,6 @@
 ---
-github_repo_url: "git@github.com:yourorg/gcp-cidr-backup.git"
-github_branch: "main"
-github_repo_dir: "/tmp/gcp-cidr-repo"
-excel_file: "{{ github_repo_dir }}/cidr_pool.xlsx"
+excel_base_dir: "{{ playbook_dir }}/../cidr_data"
+excel_file: "{{ excel_base_dir }}/cidr_pool.xlsx"
 excel_sheet: "cidr_pool_master"
 service_account_file: "/path/to/gcp_service_account.json"
 max_subnets: 5

@@ -1,9 +1,8 @@
 ---
-- name: Daily IP pool monitor - send alert if parent range low
+- name: Daily IP pool monitor - send alert if parent range low (local Excel)
   hosts: local
   gather_facts: false
   vars_files:
     - ../vars.yml
   roles:
-    - role: sync_git
     - role: monitor_pool
