@@ -1,0 +1,13 @@
+---
+github_repo_url: "git@github.com:yourorg/gcp-cidr-backup.git"
+github_branch: "main"
+github_repo_dir: "/tmp/gcp-cidr-repo"
+excel_file: "{{ github_repo_dir }}/cidr_pool.xlsx"
+excel_sheet: "cidr_pool_master"
+service_account_file: "/path/to/gcp_service_account.json"
+max_subnets: 5
+lockfile: "/var/lock/ansible_cidr_alloc.lock"
+monitor_threshold_percent: 10
+smtp_host: "smtp.yourdomain.com"
+smtp_port: 25
+email_to: "network-team@yourdomain.com"

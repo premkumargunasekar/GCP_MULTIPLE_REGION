@@ -1,0 +1,18 @@
+---
+- name: Ensure repo dir exists and is a git repo (clone or pull)
+  ansible.builtin.git:
+    repo: "{{ github_repo_url }}"
+    dest: "{{ github_repo_dir }}"
+    version: "{{ github_branch }}"
+    force: yes
+    accept_hostkey: yes
+
+- name: Ensure excel file exists
+  ansible.builtin.stat:
+    path: "{{ excel_file }}"
+  register: excel_stat
+
+- name: Fail if excel missing
+  ansible.builtin.fail:
+    msg: "Excel file {{ excel_file }} not found in repo. Upload cidr_pool.xlsx and retry."
+  when: not excel_stat.stat.exists

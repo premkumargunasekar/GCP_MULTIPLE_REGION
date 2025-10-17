@@ -1,0 +1,5 @@
+---
+github_repo_url: "{{ github_repo_url }}"
+github_branch: "{{ github_branch }}"
+github_repo_dir: "{{ github_repo_dir }}"
+excel_file: "{{ excel_file }}"
