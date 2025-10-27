@@ -2,8 +2,8 @@
 - name: Allocate CIDRs from Excel & create GCP subnets (local Excel)
   hosts: localhost
   gather_facts: false
-  vars_files:
-    - ../vars.yml
+  #vars_files:
+   # - ../vars.yml
   roles:
     - role: allocater_cidr
     - role: create_subnet
