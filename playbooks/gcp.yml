@@ -5,7 +5,7 @@
   gather_facts: no
 
   vars:
-    github_repo_url: "https://github.com/username/GCP_MULTIPLE_REGION.git"
+    github_repo_url: "https://github.com/premkumargunasekar/GCP_MULTIPLE_REGION.git"
     repo_local_path: "/tmp/ip-repo"
     excel_file_path: "{{ repo_local_path }}/cidr_data/cidr_pool.csv"
     vpc_name: "prem-vpc-network"
