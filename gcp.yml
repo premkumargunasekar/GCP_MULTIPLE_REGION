@@ -4,8 +4,8 @@
   gather_facts: no
 
   vars:
-    project_id: "your-gcp-project-id"
-    vpc_name: "vpc-main"
+    project_id: "curious-idea-475407-d2"
+    vpc_name: "prem-vpc-network"
     github_repo_url: "https://github.com/premkumargunasekar/GCP_MULTIPLE_REGION.git"
     repo_local_path: "/tmp/ip-repo"
     excel_file_path: "{{ repo_local_path }}/cidr_data/cidr_pool.xlsx"
