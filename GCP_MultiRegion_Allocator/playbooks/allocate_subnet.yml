@@ -1,0 +1,96 @@
+---
+- name: Run Python allocator to find available subnet
+  ansible.builtin.shell: |
+    python3 - <<'PY'
+    import json, ipaddress, os, sys
+
+    pool_json = os.environ.get('POOLS_JSON')
+    req_region = os.environ.get('REQ_REGION')
+    desired_prefix = int(os.environ.get('DESIRED_PREFIX'))
+
+    pools = json.loads(pool_json)
+
+    def used_set(s):
+        if not s:
+            return set()
+        return set([x.strip() for x in s.split(',') if x.strip()])
+
+    for p in pools:
+        base = p.get("CIDR Range")
+        if not base:
+            continue
+        try:
+            base_net = ipaddress.ip_network(base.strip())
+        except Exception:
+            continue
+
+        if base_net.prefixlen > desired_prefix:
+            continue
+
+        subs = list(base_net.subnets(new_prefix=desired_prefix))
+        used = used_set(p.get("Used CIDRs",""))
+        for s in subs:
+            sstr = str(s)
+            conflict = False
+            for u in used:
+                try:
+                    up = ipaddress.ip_network(u)
+                except:
+                    continue
+                if s.overlaps(up):
+                    conflict = True
+                    break
+            if not conflict:
+                out = {
+                  "selected": sstr,
+                  "pool_index": pools.index(p),
+                  "pool_cidr": p.get("CIDR Range")
+                }
+                print(json.dumps(out))
+                sys.exit(0)
+
+    print(json.dumps({}))
+    PY
+  environment:
+    POOLS_JSON: "{{ pool_data.list | to_json }}"
+    REQ_REGION: "{{ req.region }}"
+    DESIRED_PREFIX: "{{ (req.subnet_size.split('/')[-1]) | int }}"
+  register: carve_result
+  changed_when: false
+
+- name: Parse Python allocator output
+  ansible.builtin.set_fact:
+    carve_out: "{{ carve_result.stdout | from_json }}"
+
+- name: Fail if no CIDR allocated
+  ansible.builtin.fail:
+    msg: "Unable to allocate {{ req.subnet_size }} for region {{ req.region }} — no available space."
+  when: carve_out is not defined or carve_out == {}
+
+- name: Create subnet name based on previous name
+  ansible.builtin.set_fact:
+    subnet_name: "{{ req.region }}-auto-{{ req_idx + 1 }}-{{ (carve_out.selected | regex_replace('/', '-')) }}"
+
+- name: Create subnet in GCP
+  google.cloud.gcp_compute_subnetwork:
+    name: "{{ subnet_name }}"
+    project: "{{ project_id }}"
+    region: "{{ req.region }}"
+    ip_cidr_range: "{{ carve_out.selected }}"
+    network: "{{ vpc_name }}"
+    auth_kind: serviceaccount
+    state: present
+  register: gcp_create_result
+  retries: 2
+  delay: 5
+  until: gcp_create_result is succeeded
+
+- name: Update results
+  ansible.builtin.set_fact:
+    allocation_results: "{{ allocation_results + [ {
+      'region': req.region,
+      'subnet_size': req.subnet_size,
+      'allocated_cidr': carve_out.selected,
+      'pool_cidr': carve_out.pool_cidr,
+      'subnet_name': subnet_name
+    } ] }}"

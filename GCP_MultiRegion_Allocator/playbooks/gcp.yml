@@ -1,0 +1,56 @@
+---
+- name: GCP Multi-Region Subnet Allocator (Max 5 per run)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    project_id: "your-gcp-project-id"
+    vpc_name: "your-vpc-name"
+    request_file: "cidr_data/request.json"
+
+  tasks:
+    - name: Validate number of subnet requests
+      ansible.builtin.assert:
+        that: request_data | length <= 5
+        fail_msg: "You can request a maximum of 5 subnets per execution."
+      vars:
+        request_data: "{{ lookup('file', request_file) | from_json }}"
+
+    - name: Validate subnet size values
+      ansible.builtin.assert:
+        that: "'/' in item.subnet_size"
+        fail_msg: "Invalid subnet size format. Use CIDR notation (e.g., /24)."
+      loop: "{{ lookup('file', request_file) | from_json }}"
+
+    - name: Ensure Git is available
+      ansible.builtin.command: git --version
+      register: git_check
+      changed_when: false
+
+    - name: Clone latest CIDR repo from GitHub
+      ansible.builtin.git:
+        repo: "https://github.com/premkumargunasekar/GCP_MULTIPLE_REGION.git"
+        dest: "/tmp/ip-repo"
+        version: "main"
+        force: true
+
+    - name: Read CIDR pool data from CSV
+      community.general.read_csv:
+        path: "/tmp/ip-repo/cidr_data/cidr_pool.csv"
+        key: "Region"
+      register: pool_data
+
+    - name: Initialize results
+      ansible.builtin.set_fact:
+        allocation_results: []
+
+    - name: Allocate subnets per request
+      ansible.builtin.include_tasks: playbooks/allocate_subnet.yml
+      loop: "{{ lookup('file', request_file) | from_json }}"
+      loop_control:
+        loop_var: req
+        index_var: req_idx
+
+    - name: Display allocation summary
+      ansible.builtin.debug:
+        var: allocation_results
