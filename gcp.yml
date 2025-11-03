@@ -1,0 +1,127 @@
+---
+- name: GCP Multi-Region Subnet Creation (Excel: cidr_pool_master)
+  hosts: localhost
+  gather_facts: no
+
+  vars:
+    project_id: "your-gcp-project-id"
+    vpc_name: "vpc-main"
+    github_repo_url: "https://github.com/org-name/ip-repo.git"
+    repo_local_path: "/tmp/ip-repo"
+    excel_file_path: "{{ repo_local_path }}/cidr_pool_master.xlsx"
+
+    # Input from ServiceNow or AAP extra_vars
+    subnet_requests: "{{ subnet_requests | default([]) }}"
+    remarks: "{{ remarks | default('Created via ServiceNow Catalog') }}"
+
+  tasks:
+    - name: Validate subnet request count
+      ansible.builtin.assert:
+        that:
+          - subnet_requests | length > 0
+          - subnet_requests | length <= 5
+        fail_msg: "Please request between 1 and 5 subnets."
+
+    - name: Clone the central GitHub repo
+      ansible.builtin.git:
+        repo: "{{ github_repo_url }}"
+        dest: "{{ repo_local_path }}"
+        version: main
+        force: yes
+
+    - name: Read CIDR pool master data
+      community.general.read_excel:
+        path: "{{ excel_file_path }}"
+        sheet_name: "cidr_pool_master"
+      register: cidr_data
+
+    - name: Extract free and partially used CIDRs
+      ansible.builtin.set_fact:
+        cidr_pool: >-
+          {{ cidr_data.list | selectattr('Status', 'in', ['Free', 'Partially U']) | list }}
+
+    - name: Allocate subnets dynamically
+      loop: "{{ subnet_requests }}"
+      loop_control:
+        index_var: idx
+      vars:
+        subnet_name: "{{ item.region }}-auto-subnet-{{ idx + 1 }}"
+      block:
+        - name: Pick next available CIDR block
+          ansible.builtin.set_fact:
+            selected_pool: "{{ cidr_pool[0] }}"
+            base_cidr: "{{ cidr_pool[0]['CIDR Range'] }}"
+
+        - name: Calculate subnet allocations
+          ansible.builtin.shell: >
+            python3 - << 'EOF'
+            import ipaddress, json
+            base = ipaddress.ip_network("{{ base_cidr }}")
+            subs = list(base.subnets(new_prefix={{ item.subnet_size.split('/')[-1] }}))
+            print(json.dumps([str(s) for s in subs]))
+            EOF
+          register: calc_result
+
+        - name: Convert result to list
+          ansible.builtin.set_fact:
+            subnet_list: "{{ calc_result.stdout | from_json }}"
+
+        - name: Choose first unused subnet
+          ansible.builtin.set_fact:
+            allocated_cidr: "{{ subnet_list | difference(selected_pool['Used CIDRs'].split(', ') if selected_pool['Used CIDRs'] else []) | first }}"
+
+        - name: Create subnet in GCP
+          google.cloud.gcp_compute_subnetwork:
+            name: "{{ subnet_name }}"
+            region: "{{ item.region }}"
+            ip_cidr_range: "{{ allocated_cidr }}"
+            network: "{{ vpc_name }}"
+            project: "{{ project_id }}"
+            state: present
+            auth_kind: serviceaccount
+            service_account_file: "{{ credentials_file }}"
+          register: subnet_result
+
+        - name: Update CIDR pool entry
+          vars:
+            updated_used: >-
+              {% if selected_pool['Used CIDRs'] %}
+              {{ selected_pool['Used CIDRs'] + ', ' + allocated_cidr }}
+              {% else %}
+              {{ allocated_cidr }}
+              {% endif %}
+            new_status: >-
+              {% if updated_used | regex_findall('(/\\d+)') | length >= (base_cidr | ipaddr('numhosts')) / (item.subnet_size | ipaddr('numhosts')) %}
+              Used
+              {% else %}
+              Partially U
+              {% endif %}
+          community.general.write_excel:
+            path: "{{ excel_file_path }}"
+            sheet_name: "cidr_pool_master"
+            data:
+              - CIDR_Range: "{{ selected_pool['CIDR Range'] }}"
+                Status: "{{ new_status }}"
+                Used_CIDRs: "{{ updated_used }}"
+                Allocated_To: "{{ project_id }}"
+                Region: "{{ item.region }}"
+                Date_Allocated: "{{ ansible_date_time.date }}"
+            start_row: "{{ selected_pool['row'] }}"
+            header: yes
+
+    - name: Commit and push Excel changes to GitHub
+      ansible.builtin.shell: |
+        cd {{ repo_local_path }}
+        git config user.name "ansible-automation"
+        git config user.email "ansible@domain.com"
+        git add {{ excel_file_path }}
+        git commit -m "Subnet allocations updated via AAP"
+        git push origin main
+      register: git_push_result
+      changed_when: "'nothing to commit' not in git_push_result.stdout"
+
+    - name: Display summary
+      ansible.builtin.debug:
+        msg: >
+          Created {{ subnet_requests | length }} subnets.
+          Updated Excel pushed to GitHub.
