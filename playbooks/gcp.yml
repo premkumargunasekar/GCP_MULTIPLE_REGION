@@ -5,7 +5,7 @@
   gather_facts: no
 
   vars:
-    github_repo_url: "https://github.com/premkumargunasekar/GCP_MULTIPLE_REGION.git"
+    github_repo_url: "https://github.com/premkumargunasekar/GCP_MULTIPLE_REGION.git"  
     repo_local_path: "/tmp/ip-repo"
     excel_file_path: "{{ repo_local_path }}/cidr_data/cidr_pool.csv"
     pool_sheet: "cidr_pool_master"
@@ -14,7 +14,7 @@
 
     subnet_requests: "{{ subnet_requests | default([]) }}"
     remarks: "{{ remarks | default('Created via AAP/ServiceNow Catalog') }}"
-    allowed_sizes: ['/23','/24','/25','/26','/27','/28','/29']
+    allowed_sizes: ['/23', '/24', '/25', '/26', '/27', '/28', '/29']
     max_requests: 5
 
   tasks:
@@ -34,12 +34,11 @@
           - invalids | length == 0
         fail_msg: "Invalid subnet sizes: {{ invalids }}. Allowed: {{ allowed_sizes }}"
 
-    - name: Ensure git is available
+    - name: Ensure Git is available
       ansible.builtin.command: git --version
       register: git_check
       failed_when: git_check.rc != 0
       changed_when: false
-
 
     - name: Clone latest CIDR repo from GitHub
       ansible.builtin.git:
@@ -50,25 +49,25 @@
       delegate_to: localhost
       become: false
 
-    - name: Read pool data from CSV
+    - name: Read CIDR pool data from CSV
       ansible.builtin.read_csv:
         path: "{{ excel_file_path }}"
       register: pool_data
 
     - name: Extract available CIDR pools (Free or Partially)
       ansible.builtin.set_fact:
-        candidate_pools: "{{ pool_data.list | selectattr('Status','match','(?i)Free|Partially') | list }}"
+        candidate_pools: "{{ pool_data.list | selectattr('Status', 'match', '(?i)Free|Partially') | list }}"
 
-    - name: Fail if no candidate pools
+    - name: Fail if no candidate pools are available
       ansible.builtin.fail:
         msg: "No Free or Partially Used CIDRs found in {{ excel_file_path }}"
       when: candidate_pools | length == 0
 
-    - name: Initialize allocation results list
+    - name: Initialize allocation results
       ansible.builtin.set_fact:
         allocation_results: []
 
-    - name: Include subnet allocation for each request
+    - name: Allocate subnets for each request
       ansible.builtin.include_tasks: allocate_subnet.yml
       loop: "{{ subnet_requests }}"
       loop_control:
