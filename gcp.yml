@@ -1,127 +1,281 @@
 ---
-- name: GCP Multi-Region Subnet Creation (Excel: cidr_pool_master)
+- name: GCP per-subnet-size allocator (max 5 requests)
   hosts: localhost
   gather_facts: no
 
   vars:
-    project_id: "curious-idea-475407-d2"
-    vpc_name: "prem-vpc-network"
     github_repo_url: "https://github.com/premkumargunasekar/GCP_MULTIPLE_REGION.git"
     repo_local_path: "/tmp/ip-repo"
     excel_file_path: "{{ repo_local_path }}/cidr_data/cidr_pool.xlsx"
-
-    # Input from ServiceNow or AAP extra_vars
+    pool_sheet: "cidr_pool_master"
+    vpc_name: "prem-vpc-network"
+    project_id: "curious-idea-475408-d2"
+    # Inputs: list of dicts [{region:..., subnet_size:"/24"}, ...]
     subnet_requests: "{{ subnet_requests | default([]) }}"
-    remarks: "{{ remarks | default('Created via ServiceNow Catalog') }}"
+    remarks: "{{ remarks | default('Created via AAP/ServiceNow') }}"
+    allowed_sizes: ['/23','/24','/25','/26','/27','/28','/29']
+    max_requests: 5
 
   tasks:
-    - name: Validate subnet request count
-      ansible.builtin.assert:
+
+    - name: Validate request count
+      assert:
         that:
           - subnet_requests | length > 0
-          - subnet_requests | length <= 5
-        fail_msg: "Please request between 1 and 5 subnets."
+          - subnet_requests | length <= max_requests
+        fail_msg: "You must request between 1 and {{ max_requests }} subnets."
 
-    - name: Clone the central GitHub repo
-      ansible.builtin.git:
+    - name: Validate each subnet_size value
+      vars:
+        invalids: "{{ subnet_requests | map(attribute='subnet_size') | reject('in', allowed_sizes) | list }}"
+      assert:
+        that:
+          - invalids | length == 0
+        fail_msg: "Invalid subnet_size(s) found: {{ invalids }}. Allowed: {{ allowed_sizes }}"
+
+    - name: Ensure git present
+      package:
+        name: git
+        state: present
+
+    - name: Clone GitHub repo (latest)
+      git:
         repo: "{{ github_repo_url }}"
         dest: "{{ repo_local_path }}"
         version: main
         force: yes
 
-    - name: Read CIDR pool master data
+    - name: Read cidr_pool_master sheet from Excel
       community.general.read_excel:
         path: "{{ excel_file_path }}"
-        sheet_name: "cidr_pool_master"
-      register: cidr_data
+        sheet_name: "{{ pool_sheet }}"
+      register: pool_data
 
-    - name: Extract free and partially used CIDRs
-      ansible.builtin.set_fact:
-        cidr_pool: >-
-          {{ cidr_data.list | selectattr('Status', 'in', ['Free', 'Partially U']) | list }}
-
-    - name: Allocate subnets dynamically
-      loop: "{{ subnet_requests }}"
-      loop_control:
-        index_var: idx
+    - name: Normalize pool rows into list with row index
+      set_fact:
+        pools: >-
+          {{ pool_data.list | 
+             enumerate(start=2) |                # assume header at row 1; row numbers start at 2
+             map('combine', [{'row': item.0, 'data': item.1}]) |
+             map(attribute='data') |
+             list }}
       vars:
-        subnet_name: "{{ item.region }}-auto-subnet-{{ idx + 1 }}"
+        # Note: pool_data.list is a list of dict rows (column header -> value)
+
+    - name: Build a helper list of candidate pools (Status Free or Partially)
+      set_fact:
+        candidate_pools: >-
+          {{ pool_data.list | 
+             selectattr('Status','match','(?i)Free|Partially') | 
+             list }}
+
+    - name: Fail if no candidate pools
+      fail:
+        msg: "No Free or Partially pools available in {{ excel_file_path }} (sheet {{ pool_sheet }})"
+      when: candidate_pools | length == 0
+
+    - name: Allocate subnets for each request
+      vars:
+        allocation_results: []
       block:
-        - name: Pick next available CIDR block
-          ansible.builtin.set_fact:
-            selected_pool: "{{ cidr_pool[0] }}"
-            base_cidr: "{{ cidr_pool[0]['CIDR Range'] }}"
+        - name: Set initial allocation list
+          set_fact:
+            allocation_results: []
 
-        - name: Calculate subnet allocations
-          ansible.builtin.shell: >
-            python3 - << 'EOF'
-            import ipaddress, json
-            base = ipaddress.ip_network("{{ base_cidr }}")
-            subs = list(base.subnets(new_prefix={{ item.subnet_size.split('/')[-1] }}))
-            print(json.dumps([str(s) for s in subs]))
-            EOF
-          register: calc_result
+        - name: Loop over requests and allocate one-by-one
+          loop: "{{ subnet_requests }}"
+          loop_control:
+            index_var: req_idx
+            loop_var: req
+          block:
 
-        - name: Convert result to list
-          ansible.builtin.set_fact:
-            subnet_list: "{{ calc_result.stdout | from_json }}"
+            - name: Find a pool that can satisfy required subnet size
+              vars:
+                req_prefix: "{{ (req.subnet_size).split('/')[-1] | int }}"
+              set_fact:
+                chosen_pool: "{{ (candidate_pools | 
+                                  selectattr('CIDR Range', 'defined') | 
+                                  map('combine', {'row':  (pool_data.list | index( (candidate_pools | index(req) ) ) )}) | list) | first }}"
+              # We'll attempt a simpler approach in next task using Python
 
-        - name: Choose first unused subnet
-          ansible.builtin.set_fact:
-            allocated_cidr: "{{ subnet_list | difference(selected_pool['Used CIDRs'].split(', ') if selected_pool['Used CIDRs'] else []) | first }}"
+            - name: Carve a subnet from pools using python ipaddress (search pools sequentially)
+              vars:
+                desired_prefix: "{{ (req.subnet_size).split('/')[-1] | int }}"
+              block:
+                - name: Run Python to choose an available sub-subnet for this request
+                  shell: |
+                    python3 - <<'PY'
+import json, ipaddress, sys
+# Load pool rows from Ansible provided JSON via env (we pass via stdin)
+import sys, os
+pool_json = os.environ.get('POOLS_JSON')
+req_region = os.environ.get('REQ_REGION')
+desired_prefix = int(os.environ.get('DESIRED_PREFIX'))
+# pool_json is a JSON array of objects; each object has keys including "CIDR Range", "Used CIDRs" (string or empty), "Status"
+pools = json.loads(pool_json)
+def used_set(s):
+    if not s:
+        return set()
+    # assume comma+space separated
+    return set([x.strip() for x in s.split(',') if x.strip()])
 
-        - name: Create subnet in GCP
-          google.cloud.gcp_compute_subnetwork:
-            name: "{{ subnet_name }}"
-            region: "{{ item.region }}"
-            ip_cidr_range: "{{ allocated_cidr }}"
-            network: "{{ vpc_name }}"
-            project: "{{ project_id }}"
-            state: present
-            auth_kind: serviceaccount
-            service_account_file: "{{ credentials_file }}"
-          register: subnet_result
+for p in pools:
+    base = p.get("CIDR Range")
+    if not base:
+        continue
+    try:
+        base_net = ipaddress.ip_network(base.strip())
+    except Exception as e:
+        continue
+    # generate subnets of desired prefix
+    if base_net.prefixlen > desired_prefix:
+        # base is smaller than desired - cannot carve
+        continue
+    subs = list(base_net.subnets(new_prefix=desired_prefix))
+    used = used_set(p.get("Used CIDRs",""))
+    # pick first subs not in used and not overlapping used entries
+    for s in subs:
+        sstr = str(s)
+        # ensure no overlap with used (simple containment)
+        conflict = False
+        for u in used:
+            try:
+                up = ipaddress.ip_network(u)
+            except:
+                continue
+            if s.overlaps(up):
+                conflict = True
+                break
+        if not conflict:
+            out = {
+              "selected": sstr,
+              "pool_index": pools.index(p),
+              "pool_cidr": p.get("CIDR Range"),
+              "pool_row": p.get("__row") if "__row" in p else None
+            }
+            print(json.dumps(out))
+            sys.exit(0)
+# if nothing found, return empty
+print(json.dumps({}))
+PY
+                  environment:
+                    POOLS_JSON: "{{ candidate_pools | to_json }}"
+                    REQ_REGION: "{{ req.region }}"
+                    DESIRED_PREFIX: "{{ (req.subnet_size.split('/')[-1]) | int }}"
+                  register: carve_result
+                  changed_when: false
 
-        - name: Update CIDR pool entry
-          vars:
-            updated_used: >-
-              {% if selected_pool['Used CIDRs'] %}
-              {{ selected_pool['Used CIDRs'] + ', ' + allocated_cidr }}
+                - name: Parse carve result
+                  set_fact:
+                    carve_out: "{{ carve_result.stdout | from_json }}"
+
+                - name: Fail if cannot allocate any matching CIDR
+                  fail:
+                    msg: "Unable to allocate a {{ req.subnet_size }} subnet for request {{ req }} - no available space in pools."
+                  when: carve_out.selected is not defined or carve_out == {}
+
+            - name: Create the subnet in GCP
+              google.cloud.gcp_compute_subnetwork:
+                name: "{{ req.region }}-auto-{{ req_idx + 1 }}-{{ (carve_out.selected | regex_replace('/', '-')) }}"
+                project: "{{ project_id }}"
+                region: "{{ req.region }}"
+                ip_cidr_range: "{{ carve_out.selected }}"
+                network: "{{ vpc_name }}"
+                auth_kind: serviceaccount
+                # Service account handled by AAP credential injection; if your AAP sets GOOGLE_APPLICATION_CREDENTIALS env, module will pick it.
+                state: present
+              register: gcp_create_result
+              retries: 2
+              delay: 5
+              until: gcp_create_result is succeeded
+
+            - name: Record allocation to list
+              set_fact:
+                allocation_results: "{{ allocation_results + [ {
+                   'request_index': req_idx,
+                   'region': req.region,
+                   'subnet_size': req.subnet_size,
+                   'allocated_cidr': carve_out.selected,
+                   'pool_cidr': carve_out.pool_cidr,
+                   'pool_index': carve_out.pool_index,
+                   'pool_row': carve_out.pool_row,
+                   'subnet_name': gcp_create_result.name if (gcp_create_result is defined and 'name' in gcp_create_result) else (req.region + '-auto-' + (req_idx | string))
+                } ] }}"
+
+            - name: Update candidate_pools: mark this CIDR as used in-memory
+              set_fact:
+                candidate_pools: >-
+                  {{
+                    candidate_pools | map('combine',
+                      {}) | list
+                  }}
+              when: false   # placeholder: we will update the excel in a separate step below
+
+    - name: Show allocations
+      debug:
+        var: allocation_results
+
+    - name: Update Excel entries for each allocation (append Used CIDRs / Region / Date / Status)
+      vars:
+        today: "{{ ansible_date_time.date }}"
+      loop: "{{ allocation_results }}"
+      loop_control:
+        loop_var: alloc
+      block:
+        - name: Read full pool row that matches pool_cidr
+          set_fact:
+            matching_row: "{{ pool_data.list | selectattr('CIDR Range','equalto', alloc.pool_cidr) | list | first }}"
+
+        - name: Compute new Used_CIDRs string
+          set_fact:
+            existing_used: "{{ (matching_row['Used CIDRs'] | default('')) | trim }}"
+            new_used: >-
+              {% if existing_used %}
+                {{ (existing_used + ', ' + alloc.allocated_cidr) }}
               {% else %}
-              {{ allocated_cidr }}
+                {{ alloc.allocated_cidr }}
               {% endif %}
+
+        - name: Decide new Status (simple heuristic)
+          set_fact:
             new_status: >-
-              {% if updated_used | regex_findall('(/\\d+)') | length >= (base_cidr | ipaddr('numhosts')) / (item.subnet_size | ipaddr('numhosts')) %}
-              Used
+              {% set base = matching_row['CIDR Range'] %}
+              {% set already = (new_used|regex_findall('(/\\d+)')|length) %}
+              {% if 'Used' in matching_row['Status'] %}
+                Used
               {% else %}
-              Partially U
+                Partially Used
               {% endif %}
+
+        - name: Write back update to Excel (update the pool row)
           community.general.write_excel:
             path: "{{ excel_file_path }}"
-            sheet_name: "cidr_pool_master"
+            sheet_name: "{{ pool_sheet }}"
+            # We update the row for the pool -> several implementations of write_excel exist; we use data to rewrite the row.
             data:
-              - CIDR_Range: "{{ selected_pool['CIDR Range'] }}"
+              - CIDR Range: "{{ matching_row['CIDR Range'] }}"
                 Status: "{{ new_status }}"
-                Used_CIDRs: "{{ updated_used }}"
-                Allocated_To: "{{ project_id }}"
-                Region: "{{ item.region }}"
-                Date_Allocated: "{{ ansible_date_time.date }}"
-            start_row: "{{ selected_pool['row'] }}"
+                "Used CIDRs": "{{ new_used }}"
+                "Allocated To": "{{ project_id }}"
+                "Region": "{{ alloc.region }}"
+                "Date Allocated": "{{ today }}"
+            start_row: "{{ (pool_data.list | index(matching_row) ) + 2 }}"
             header: yes
+          delegate_to: localhost
 
-    - name: Commit and push Excel changes to GitHub
-      ansible.builtin.shell: |
+    - name: Commit and push changes back to GitHub
+      shell: |
         cd {{ repo_local_path }}
         git config user.name "ansible-automation"
         git config user.email "ansible@domain.com"
         git add {{ excel_file_path }}
-        git commit -m "Subnet allocations updated via AAP"
+        git commit -m "Subnet allocations via AAP: {{ subnet_requests | to_nice_json }}"
         git push origin main
-      register: git_push_result
-      changed_when: "'nothing to commit' not in git_push_result.stdout"
+      register: git_push
+      changed_when: "'nothing to commit' not in git_push.stdout"
 
-    - name: Display summary
-      ansible.builtin.debug:
-        msg: >
-          Created {{ subnet_requests | length }} subnets.
-          Updated Excel pushed to GitHub.
+    - name: Final summary
+      debug:
+        msg:
+          - "Allocations completed"
+          - "Details: {{ allocation_results }}"
