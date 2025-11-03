@@ -6,7 +6,7 @@
   vars:
     github_repo_url: "https://github.com/premkumargunasekar/GCP_MULTIPLE_REGION.git"
     repo_local_path: "/tmp/ip-repo"
-    excel_file_path: "{{ repo_local_path }}/cidr_data/cidr_pool.xlsx"
+    excel_file_path: "{{ repo_local_path }}/cidr_data/cidr_pool.csv"
     pool_sheet: "cidr_pool_master"
     vpc_name: "prem-vpc-network"
     project_id: "curious-idea-475408-d2"
