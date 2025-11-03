@@ -1,6 +1,8 @@
 ---
 - name: GCP Multi-Region Subnet Allocator (Max 5 per run)
   hosts: localhost
+  become: true
+  become_method: sudo
   gather_facts: no
 
   vars:
