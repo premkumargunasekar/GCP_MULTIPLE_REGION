@@ -78,10 +78,13 @@
 
     - name: Ensure csv exists
       ansible.builtin.stat:
-        path: "{{ excel_file_path }}"
-      register: csv_stat
-      failed_when: not csv_stat.stat.exists
-      failed_msg: "CIDR pool CSV not found at {{ excel_file_path }}; ensure repo contains cidr_pool.csv"
+        path: "{{ cidr_excel_path }}"
+      register: file_status
+
+    - name: Fail if Excel file does not exist
+      ansible.builtin.fail:
+        msg: "The Excel file is missing at {{ cidr_excel_path }}"
+      when: not file_status.stat.exists
 
     - name: Backup CIDR CSV (timestamped)
       ansible.builtin.copy:
