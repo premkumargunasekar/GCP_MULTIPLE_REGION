@@ -117,7 +117,7 @@
       register: pool_data
       delegate_to: localhost
 
-    - name: Filter available CIDR pools (Status: Free or Partially)
+    - name: "Filter available CIDR pools (Status: Free or Partially)"
       ansible.builtin.set_fact:
         candidate_pools: "{{ pool_data.list | selectattr('Status', 'match', '(?i)^(Free|Partially)$') | list }}"
 
