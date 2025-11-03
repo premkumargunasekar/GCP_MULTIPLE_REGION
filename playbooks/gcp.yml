@@ -35,10 +35,10 @@
           - invalids | length == 0
         fail_msg: "Invalid subnet sizes: {{ invalids }}. Allowed: {{ allowed_sizes }}"
 
-    - name: Ensure git is installed
-      ansible.builtin.package:
-        name: git
-        state: present
+    - name: Skip git installation in AWX
+      ansible.builtin.debug:
+         msg: "Git installation skipped — already available in the container."
+
 
     - name: Clone latest CIDR repo from GitHub
       ansible.builtin.git:
