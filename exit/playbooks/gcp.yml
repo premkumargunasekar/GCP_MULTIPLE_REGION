@@ -1,23 +1,40 @@
 ---
-- name: GCP Multi-Region Subnet Allocator (Max 5 per run)
+- name: GCP Multi-Region Subnet Allocator (Production-ready)
   hosts: localhost
   connection: local
   gather_facts: no
 
   vars:
+    # repo & paths
     github_repo_url: "https://github.com/premkumargunasekar/GCP_MULTIPLE_REGION.git"
+    git_branch: "main"
     repo_local_path: "/tmp/ip-repo"
     excel_file_path: "{{ repo_local_path }}/cidr_data/cidr_pool.csv"
+    audit_file: "{{ repo_local_path }}/cidr_data/audit_log.txt"
+    csv_backup_path: "{{ repo_local_path }}/cidr_data/cidr_pool.csv.bak-{{ lookup('pipe','date +%Y%m%d%H%M%S') }}"
+
+    # GCP metadata
     vpc_name: "prem-vpc-network"
     project_id: "curious-idea-475408-d2"
 
-    subnet_requests: "{{ subnet_requests | default([]) }}"
-    remarks: "{{ remarks | default('Created via AAP/ServiceNow Catalog') }}"
+    # Limits & validation
     allowed_sizes: ['/23','/24','/25','/26','/27','/28','/29']
     max_requests: 5
 
-  tasks:
+    # Locking
+    lock_file: "/tmp/gcp_cidr_alloc.lock"
+    lock_wait_seconds: 300
 
+    # Credentials (pass these securely in AWX / AAP extra_vars or credentials)
+    github_user: "{{ github_user | default(omit) }}"
+    # IMPORTANT: GITHUB_TOKEN must be provided via job credential (extra_vars or environment) and not hardcoded
+    github_token: "{{ github_token | default(lookup('env','GITHUB_TOKEN')) }}"
+
+    # Input (should be passed to playbook)
+    subnet_requests: "{{ subnet_requests | default([]) }}"
+    remarks: "{{ remarks | default('Created via AAP/ServiceNow Catalog') }}"
+
+  pre_tasks:
     - name: Validate number of subnet requests
       ansible.builtin.assert:
         that:
@@ -25,7 +42,18 @@
           - subnet_requests | length <= max_requests
         fail_msg: "Request must include 1–{{ max_requests }} subnets."
 
-    - name: Validate subnet size values
+    - name: Validate each subnet request structure
+      ansible.builtin.assert:
+        that:
+          - item.name is defined
+          - item.region is defined
+          - item.subnet_size is defined
+        fail_msg: "Each subnet request must include name, region and subnet_size (invalid item: {{ item }})."
+      loop: "{{ subnet_requests }}"
+      loop_control:
+        loop_var: item
+
+    - name: Validate subnet_size allowed values
       vars:
         invalids: "{{ subnet_requests | map(attribute='subnet_size') | reject('in', allowed_sizes) | list }}"
       ansible.builtin.assert:
@@ -39,23 +67,59 @@
       failed_when: git_check.rc != 0
       changed_when: false
 
-    - name: Clone latest CIDR repo from GitHub
+  tasks:
+    - name: Clone latest CIDR repo from GitHub (force update)
       ansible.builtin.git:
         repo: "{{ github_repo_url }}"
         dest: "{{ repo_local_path }}"
-        version: main
+        version: "{{ git_branch }}"
         force: yes
       delegate_to: localhost
-      become: false
+
+    - name: Ensure csv exists
+      ansible.builtin.stat:
+        path: "{{ excel_file_path }}"
+      register: csv_stat
+      failed_when: not csv_stat.stat.exists
+      failed_msg: "CIDR pool CSV not found at {{ excel_file_path }}; ensure repo contains cidr_pool.csv"
+
+    - name: Backup CIDR CSV (timestamped)
+      ansible.builtin.copy:
+        src: "{{ excel_file_path }}"
+        dest: "{{ csv_backup_path }}"
+        remote_src: yes
+      delegate_to: localhost
+
+    - name: Acquire allocation lock (wait if other job holds it)
+      block:
+        - name: Check for existing lock
+          ansible.builtin.stat:
+            path: "{{ lock_file }}"
+          register: lock_stat
+
+        - name: Wait for lock to be released (if present)
+          ansible.builtin.wait_for:
+            path: "{{ lock_file }}"
+            state: absent
+            timeout: "{{ lock_wait_seconds }}"
+          when: lock_stat.stat.exists
+
+        - name: Create lock file
+          ansible.builtin.copy:
+            dest: "{{ lock_file }}"
+            content: "{{ ansible_date_time.iso8601 }} | {{ inventory_hostname }} | PID: {{ ansible_pid | default('N/A') }}\n"
+            mode: '0640'
+      delegate_to: localhost
 
     - name: Read pool data from CSV
       community.general.read_csv:
         path: "{{ excel_file_path }}"
       register: pool_data
+      delegate_to: localhost
 
-    - name: Filter available CIDR pools (Free or Partially)
+    - name: Filter available CIDR pools (Status: Free or Partially)
       ansible.builtin.set_fact:
-        candidate_pools: "{{ pool_data.list | selectattr('Status', 'match', '(?i)Free|Partially') | list }}"
+        candidate_pools: "{{ pool_data.list | selectattr('Status', 'match', '(?i)^(Free|Partially)$') | list }}"
 
     - name: Fail if no candidate pools
       ansible.builtin.fail:
@@ -78,28 +142,53 @@
         vpc_name: "{{ vpc_name }}"
         repo_local_path: "{{ repo_local_path }}"
         excel_file_path: "{{ excel_file_path }}"
+        audit_file: "{{ audit_file }}"
         remarks: "{{ remarks }}"
         allocation_results: "{{ allocation_results }}"
-        subnet_requests: "{{ subnet_requests }}"
-        github_repo_url: "{{ github_repo_url }}"
+      delegate_to: localhost
 
-    - name: Show allocation summary
-      ansible.builtin.debug:
-        var: allocation_results
+    - name: Commit and push updates to GitHub (only if changes)
+      block:
+        - name: Stage changes
+          ansible.builtin.shell: |
+            set -o pipefail
+            cd "{{ repo_local_path }}"
+            git add --all
+            git status --porcelain
+          register: git_status
+          changed_when: false
 
-    - name: Commit and push updates to GitHub
-      ansible.builtin.shell: |
-        cd {{ repo_local_path }}
-        git config user.name "ansible-automation"
-        git config user.email "ansible@domain.com"
-        git add .
-        git commit -m "Subnet allocations via AAP: {{ remarks }}"
-        git push origin main
-      register: git_push
-      changed_when: "'nothing to commit' not in git_push.stdout"
+        - name: Commit changes if any
+          ansible.builtin.shell: |
+            cd "{{ repo_local_path }}"
+            git config user.name "ansible-automation"
+            git config user.email "ansible@domain.com"
+            git commit -m "Subnet allocations via AAP: {{ remarks }}" || echo "nothing to commit"
+          register: git_commit
+          changed_when: "'nothing to commit' not in git_commit.stdout"
+
+        - name: Push to origin using token (secure)
+          ansible.builtin.shell: |
+            cd "{{ repo_local_path }}"
+            # set remote using token (will hide token in AWX job output if masked there)
+            git remote set-url origin "https://{{ github_user }}:{{ github_token }}@github.com/{{ (github_repo_url.split('github.com/')[-1] | regex_replace('^.*/','') ) | default('') }}"
+            git push origin "{{ git_branch }}"
+          environment:
+            GIT_TERMINAL_PROMPT: "0"
+          register: git_push
+          failed_when: git_push.rc != 0 and "'Everything up-to-date' not in git_push.stdout"
+      when: git_status.stdout != ""
 
     - name: Final summary
       ansible.builtin.debug:
         msg:
-          - "✅ Subnet allocations completed successfully"
+          - "✅ Subnet allocations completed (results below):"
           - "{{ allocation_results }}"
+
+  post_tasks:
+    - name: Remove lock file
+      ansible.builtin.file:
+        path: "{{ lock_file }}"
+        state: absent
+      delegate_to: localhost
+      ignore_errors: yes
