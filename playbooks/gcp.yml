@@ -48,7 +48,7 @@
         force: yes
 
     - name: Read pool data from Excel
-      community.general.read_excel:
+      ansible.builtin.read_csv:
         path: "{{ excel_file_path }}"
         sheet_name: "{{ pool_sheet }}"
       register: pool_data
