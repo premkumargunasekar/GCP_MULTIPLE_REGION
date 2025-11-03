@@ -81,7 +81,7 @@
   delay: 5
   until: gcp_create_result is succeeded
 
-- name: Update results
+- name: Append allocation results
   ansible.builtin.set_fact:
     allocation_results: "{{ allocation_results + [ {
       'region': req.region,
