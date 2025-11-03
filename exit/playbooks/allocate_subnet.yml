@@ -1,92 +1,94 @@
 ---
-- name: Run Python allocator to find available subnet
+# allocate_subnet.yml
+# Expects vars from parent:
+#   - req (loop var): { name, region, subnet_size }
+#   - candidate_pools (list of csv rows/dicts)
+#   - excel_file_path, repo_local_path, audit_file, remarks
+
+- name: Select candidate pool for request (by region if column exists)
+  ansible.builtin.set_fact:
+    selected_pool: >-
+      {{
+        (candidate_pools | selectattr('Region','defined') | selectattr('Region','equalto', req.region) | list | first)
+        or
+        (candidate_pools | first)
+      }}
+
+- name: Fail if selected_pool missing or no CIDR column
+  ansible.builtin.assert:
+    that:
+      - selected_pool is defined
+      - selected_pool.CIDR is defined
+    fail_msg: "No suitable CIDR pool found for request {{ req }} or CIDR column missing in CSV."
+
+- name: Gather already allocated list from pool (if Allocated_Subnets column exists)
+  ansible.builtin.set_fact:
+    existing_allocated: "{{ (selected_pool.Allocated_Subnets | default('')) | trim() | ternary(selected_pool.Allocated_Subnets.split(';'), []) }}"
+
+- name: Compute next available subnet using python ipaddress
   ansible.builtin.shell: |
     python3 - <<'PY'
-    import json, ipaddress, os, sys
-
-    pool_json = os.environ.get('POOLS_JSON')
-    req_region = os.environ.get('REQ_REGION')
-    desired_prefix = int(os.environ.get('DESIRED_PREFIX'))
-
-    pools = json.loads(pool_json)
-
-    def used_set(s):
-        if not s:
-            return set()
-        return set([x.strip() for x in s.split(',') if x.strip()])
-
-    for p in pools:
-        base = p.get("CIDR Range")
-        if not base:
-            continue
-        try:
-            base_net = ipaddress.ip_network(base.strip())
-        except Exception:
-            continue
-
-        if base_net.prefixlen > desired_prefix:
-            continue
-
-        subs = list(base_net.subnets(new_prefix=desired_prefix))
-        used = used_set(p.get("Used CIDRs",""))
-        for s in subs:
-            sstr = str(s)
-            conflict = False
-            for u in used:
-                try:
-                    up = ipaddress.ip_network(u)
-                except:
-                    continue
-                if s.overlaps(up):
-                    conflict = True
-                    break
-            if not conflict:
-                out = {
-                  "selected": sstr,
-                  "pool_index": pools.index(p),
-                  "pool_cidr": p.get("CIDR Range")
-                }
-                print(json.dumps(out))
-                sys.exit(0)
-
-    print(json.dumps({}))
+    import sys, json, ipaddress
+    data = json.loads(sys.stdin.read())
+    pool = data['pool']
+    prefix = int(data['prefix'].lstrip('/'))
+    existing = data.get('existing', [])
+    net = ipaddress.ip_network(pool)
+    for sub in net.subnets(new_prefix=prefix):
+        if str(sub) not in existing:
+            print(str(sub))
+            sys.exit(0)
+    # no available subnet
+    sys.exit(1)
     PY
-  environment:
-    POOLS_JSON: "{{ candidate_pools | to_json }}"
-    REQ_REGION: "{{ req.region }}"
-    DESIRED_PREFIX: "{{ (req.subnet_size.split('/')[-1]) | int }}"
-  register: carve_result
-  changed_when: false
+  args:
+    stdin: >-
+      {{
+        {
+          'pool': selected_pool.CIDR,
+          'prefix': req.subnet_size,
+          'existing': existing_allocated
+        } | to_json
+      }}
+  register: alloc_result
+  failed_when: alloc_result.rc != 0
+  changed_when: true
 
-- name: Parse Python allocator output
+- name: Set allocated_cidr fact
   ansible.builtin.set_fact:
-    carve_out: "{{ carve_result.stdout | from_json }}"
+    allocated_cidr: "{{ alloc_result.stdout_lines[0] | default(alloc_result.stdout) }}"
 
-- name: Fail if no CIDR allocated
-  ansible.builtin.fail:
-    msg: "Unable to allocate {{ req.subnet_size }} for region {{ req.region }} — no available space."
-  when: carve_out is not defined or carve_out == {}
+- name: Append audit log entry
+  ansible.builtin.lineinfile:
+    path: "{{ audit_file }}"
+    create: yes
+    line: "{{ '%Y-%m-%d %H:%M:%S' | strftime }} | RequestIndex:{{ req_idx }} | Name:{{ req.name }} | Region:{{ req.region }} | Size:{{ req.subnet_size }} | PoolCIDR:{{ selected_pool.CIDR }} | Allocated:{{ allocated_cidr }} | Remarks: {{ remarks }}"
+  delegate_to: localhost
 
-- name: Create subnet in GCP
-  google.cloud.gcp_compute_subnetwork:
-    name: "{{ req.region }}-auto-{{ req_idx + 1 }}-{{ (carve_out.selected | regex_replace('/', '-')) }}"
-    project: "{{ project_id }}"
-    region: "{{ req.region }}"
-    ip_cidr_range: "{{ carve_out.selected }}"
-    network: "{{ vpc_name }}"
-    auth_kind: serviceaccount
-    state: present
-  register: gcp_create_result
-  retries: 2
-  delay: 5
-  until: gcp_create_result is succeeded
-
-- name: Append allocation results
+- name: Record allocation into results list
   ansible.builtin.set_fact:
-    allocation_results: "{{ allocation_results + [ {
-      'region': req.region,
-      'subnet_size': req.subnet_size,
-      'allocated_cidr': carve_out.selected,
-      'pool_cidr': carve_out.pool_cidr,
-      'subnet_name': gcp_create_result.name
-    } ] }}"
+    allocation_results: >-
+      {{
+        allocation_results + [
+          {
+            'request_index': req_idx,
+            'name': req.name,
+            'region': req.region,
+            'requested_size': req.subnet_size,
+            'allocated_cidr': allocated_cidr,
+            'pool_cidr': selected_pool.CIDR
+          }
+        ]
+      }}
+
+# Optional: update CSV 'Allocated_Subnets' & 'Status' columns in repo
+# This is a minimal safe approach: append an "allocation record" file rather than rewriting CSV.
+# If you want full CSV writeback, implement rewriting logic carefully (or use a dedicated module).
+- name: Append short allocation record CSV (safe, incremental)
+  ansible.builtin.lineinfile:
+    path: "{{ repo_local_path }}/cidr_data/allocations_append.csv"
+    create: yes
+    line: "{{ allocated_cidr }},{{ req.name }},{{ req.region }},{{ req.subnet_size }},{{ selected_pool.CIDR }},{{ remarks }},{{ '%Y-%m-%dT%H:%M:%S' | strftime }}"
+  delegate_to: localhost
+
+# Note: the main play commits the repo; the append file is a safe incremental log that does not rewrite the pool CSV.
