@@ -6,9 +6,9 @@
   vars:
     project_id: "your-gcp-project-id"
     vpc_name: "vpc-main"
-    github_repo_url: "https://github.com/org-name/ip-repo.git"
+    github_repo_url: "https://github.com/premkumargunasekar/GCP_MULTIPLE_REGION.git"
     repo_local_path: "/tmp/ip-repo"
-    excel_file_path: "{{ repo_local_path }}/cidr_pool_master.xlsx"
+    excel_file_path: "{{ repo_local_path }}/cidr_data/cidr_pool.xlsx"
 
     # Input from ServiceNow or AAP extra_vars
     subnet_requests: "{{ subnet_requests | default([]) }}"
