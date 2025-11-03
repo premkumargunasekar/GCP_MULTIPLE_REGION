@@ -35,9 +35,11 @@
           - invalids | length == 0
         fail_msg: "Invalid subnet sizes: {{ invalids }}. Allowed: {{ allowed_sizes }}"
 
-    - name: Skip git installation in AWX
-      ansible.builtin.debug:
-         msg: "Git installation skipped — already available in the container."
+    - name: Ensure git is available
+      ansible.builtin.command: git --version
+      register: git_check
+      failed_when: git_check.rc != 0
+      changed_when: false
 
 
     - name: Clone latest CIDR repo from GitHub
@@ -46,6 +48,8 @@
         dest: "{{ repo_local_path }}"
         version: main
         force: yes
+      delegate_to: localhost
+      become: false
 
     - name: Read pool data from CSV
       ansible.builtin.read_csv:
